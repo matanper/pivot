@@ -71,18 +71,19 @@ use std::sync::Arc;
 use arrow_array::builder::StringViewBuilder;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, RecordBatch, StringViewArray,
+    Array, ArrayRef, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch,
+    StringViewArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{BatchSize, Criterion, Throughput, black_box};
 
 use dispatch::memory::SlabAllocator;
 use dispatch::{
-    AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, DataFlowDispatcher, Dispatch,
-    Distinct, Dynamic, GroupLimit, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor,
-    OrderBy, RecordBatchOperatorSpec, RowKeyExtractor, RowKeySchema, RowSelection,
-    SelectionScratch, StringKeyExtractor, SumSlot, collect_selected_indices, memory_ctx,
-    values_input,
+    AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, CountValidSlot,
+    DataFlowDispatcher, Dispatch, Distinct, Dynamic, GroupLimit, IntKeyExtractor,
+    IntPairKeyExtractor, IntStrKeyExtractor, MaxSlot, MinSlot, OrderBy, RecordBatchOperatorSpec,
+    RowKeyExtractor, RowKeySchema, RowSelection, SelectionScratch, StringKeyExtractor, SumSlot,
+    collect_selected_indices, memory_ctx, values_input,
 };
 
 // ---------------------------------------------------------------------------
@@ -417,60 +418,236 @@ fn bench<D, F>(
 // GROUP BY scenarios
 // ---------------------------------------------------------------------------
 
-fn bench_count_runs(c: &mut Criterion, d: &DataFlowDispatcher) {
-    let rows = total_rows().max(8192 * 64).div_ceil(8192 * 64) * (8192 * 64);
-    for (name, run_length) in [
-        ("run_1", 1),
-        ("run_4", 4),
-        ("run_16", 16),
-        ("run_64", 64),
-        ("shuffled", 0),
-        ("unique", usize::MAX),
-    ] {
-        bench(
-            c,
-            d,
-            &format!("count_runs/{name}"),
-            rows,
-            || {
-                // Every non-unique shape has the same key frequencies.
-                let mut keys: Vec<i64> = (0..rows)
-                    .map(|row| {
-                        if run_length == usize::MAX {
-                            row as i64
-                        } else {
-                            ((row / run_length.max(1)) % 8192) as i64
-                        }
-                    })
-                    .collect();
-                if run_length == 0 {
-                    let mut rng = Rng::new(42);
-                    for index in (1..keys.len()).rev() {
-                        keys.swap(index, rng.below(index + 1));
-                    }
-                }
-                let sch = schema(vec![Field::new("k", DataType::Int64, false)]);
-                keys.chunks(BATCH_ROWS)
-                    .map(|chunk| batch(&sch, vec![Arc::new(Int64Array::from(chunk.to_vec()))]))
-                    .collect()
-            },
-            |s| {
-                s.group_by_aggregate::<IntKeyExtractor<Int64Type>, Compiled<(CountSlot,)>>(
-                    vec![0],
-                    vec![AggregationSlot::new(
-                        AggregationKind::CountStar,
-                        0,
-                        DataType::Int64,
-                    )],
-                    Some(GroupLimit::TopK {
-                        slot: 0,
-                        limit: 10,
-                        with_ties: false,
-                    }),
-                    (),
-                )
-            },
-        );
+fn make_run_input(rows: usize, shape: &str) -> Vec<RecordBatch> {
+    let run = match shape {
+        "run_16" => 16,
+        "run_64" => 64,
+        _ => 1,
+    };
+    let mut keys: Vec<i64> = (0..rows).map(|row| ((row / run) % 8192) as i64).collect();
+    if shape == "shuffled" {
+        let mut seed = 42u64;
+        for index in (1..rows).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            keys.swap(index, seed as usize % (index + 1));
+        }
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("value", DataType::Int32, false),
+        Field::new("wide", DataType::Int64, false),
+        Field::new("nullable", DataType::Int32, true),
+        Field::new("float", DataType::Float64, false),
+        Field::new("text", DataType::Utf8View, false),
+    ]));
+    keys.chunks(65536)
+        .map(|keys| {
+            let n = keys.len();
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(keys.to_vec())),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..n).map(|row| (row % 101) as i32 - 50),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..n).map(|row| i64::MAX / 1000 + row as i64),
+                )),
+                Arc::new(Int32Array::from(
+                    (0..n)
+                        .map(|row| (row % 7 != 0).then_some((row % 101) as i32 - 50))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from_iter_values(
+                    (0..n).map(|row| (row % 101) as f64 * 0.5),
+                )),
+                Arc::new(StringViewArray::from_iter_values(
+                    (0..n).map(|row| format!("a-long-string-value-{:04}", row % 101)),
+                )),
+            ];
+            RecordBatch::try_new(schema.clone(), columns).unwrap()
+        })
+        .collect()
+}
+fn make_run_slot(kind: AggregationKind, column: usize, output: DataType) -> AggregationSlot {
+    AggregationSlot::new(kind, column, output)
+}
+fn build_run_values(input: RecordBatchOperatorSpec, signature: &str) -> RecordBatchOperatorSpec {
+    let count = make_run_slot(AggregationKind::CountStar, 0, DataType::Int64);
+    let sum = make_run_slot(AggregationKind::Sum, 1, DataType::Int64);
+    match signature {
+        "sum" => input.group_by_aggregate::<IntKeyExtractor<Int64Type>,Compiled<(SumSlot<Int32Type>,)>>(vec![0],vec![sum],None,()),
+        "wide_sum" => input.group_by_aggregate::<IntKeyExtractor<Int64Type>,Compiled<(SumSlot<Int64Type,i128>,)>>(vec![0],vec![make_run_slot(AggregationKind::Sum,2,DataType::Decimal128(38,0))],None,()),
+        "extrema" => input.group_by_aggregate::<IntKeyExtractor<Int64Type>,Compiled<(MinSlot<Int32Type>,MaxSlot<Int32Type>)>>(vec![0],vec![make_run_slot(AggregationKind::Min,1,DataType::Int64),make_run_slot(AggregationKind::Max,1,DataType::Int64)],None,()),
+        "count_sum" => input.group_by_aggregate::<IntKeyExtractor<Int64Type>,Compiled<(CountSlot,SumSlot<Int32Type>)>>(vec![0],vec![count,sum],None,()),
+        "nullable" => input.group_by_aggregate::<IntKeyExtractor<Int64Type>,Compiled<(CountValidSlot,SumSlot<Int32Type>,MinSlot<Int32Type>,MaxSlot<Int32Type>),u8>>(vec![0],vec![make_run_slot(AggregationKind::Count,3,DataType::Int64),make_run_slot(AggregationKind::Sum,3,DataType::Int64),make_run_slot(AggregationKind::Min,3,DataType::Int64),make_run_slot(AggregationKind::Max,3,DataType::Int64)],None,()),
+        "dynamic_numeric" => input.group_by_aggregate::<IntKeyExtractor<Int64Type>,Dynamic<i128>>(vec![0],vec![count,sum,make_run_slot(AggregationKind::Sum,4,DataType::Float64),make_run_slot(AggregationKind::Min,4,DataType::Float64),make_run_slot(AggregationKind::Max,4,DataType::Float64)],None,()),
+        "dynamic_strings" => input.group_by_aggregate::<IntKeyExtractor<Int64Type>,Dynamic<i128>>(vec![0],vec![count,make_run_slot(AggregationKind::Min,5,DataType::Utf8View),make_run_slot(AggregationKind::Max,5,DataType::Utf8View)],None,()),
+        _ => unreachable!(),
+    }
+}
+fn make_key_run_input(rows: usize, shape: &str) -> Vec<RecordBatch> {
+    make_run_input(rows, shape)
+        .into_iter()
+        .map(|batch| {
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let mut fields = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect::<Vec<_>>();
+            let mut columns = batch.columns().to_vec();
+            let extra: Vec<ArrayRef> = vec![
+                Arc::new(StringViewArray::from_iter_values(
+                    keys.values()
+                        .iter()
+                        .map(|key| format!("same-prefix-long-ü-key-{key:04}")),
+                )),
+                Arc::new(StringViewArray::from_iter_values(
+                    keys.values().iter().map(|key| format!("k{key:04}")),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    keys.values().iter().map(|key| key / 16),
+                )),
+                Arc::new(Int32Array::from_iter_values(
+                    keys.values().iter().map(|key| (key % 16) as i32),
+                )),
+                Arc::new(Int64Array::from(
+                    keys.values()
+                        .iter()
+                        .map(|key| (key % 5 != 0).then_some(key / 16))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringViewArray::from_iter(keys.values().iter().map(
+                    |key| (key % 7 != 0).then(|| format!("nullable-long-key-{key:04}")),
+                ))),
+                Arc::new(
+                    arrow_array::Decimal128Array::from_iter_values(
+                        keys.values().iter().map(|key| *key as i128 * 100),
+                    )
+                    .with_precision_and_scale(20, 2)
+                    .unwrap(),
+                ),
+            ];
+            for column in extra {
+                fields.push(Field::new(
+                    format!("key{}", columns.len()),
+                    column.data_type().clone(),
+                    column.null_count() > 0,
+                ));
+                columns.push(column);
+            }
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        })
+        .collect()
+}
+fn build_run_keys(input: RecordBatchOperatorSpec, representation: &str) -> RecordBatchOperatorSpec {
+    use dispatch::{
+        HashOnlyIntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor, RowKeyExtractor,
+        RowKeySchema, StringKeyExtractor,
+    };
+    type Value = Compiled<(CountSlot, SumSlot<Int32Type>)>;
+    let slots = vec![
+        make_run_slot(AggregationKind::CountStar, 0, DataType::Int64),
+        make_run_slot(AggregationKind::Sum, 1, DataType::Int64),
+    ];
+    match representation {
+        "integer" => {
+            input.group_by_aggregate::<IntKeyExtractor<Int64Type>, Value>(vec![0], slots, None, ())
+        }
+        "long_string" => {
+            input.group_by_aggregate::<StringKeyExtractor, Value>(vec![6], slots, None, ())
+        }
+        "short_string" => {
+            input.group_by_aggregate::<StringKeyExtractor, Value>(vec![7], slots, None, ())
+        }
+        "integer_pair" => input
+            .group_by_aggregate::<IntPairKeyExtractor<Int64Type, Int32Type>, Value>(
+                vec![8, 9],
+                slots,
+                None,
+                (),
+            ),
+        "integer_string" => input.group_by_aggregate::<IntStrKeyExtractor<Int64Type>, Value>(
+            vec![8, 6],
+            slots,
+            None,
+            (),
+        ),
+        "row_triple" => input.group_by_aggregate::<RowKeyExtractor, Value>(
+            vec![8, 9, 6],
+            slots,
+            None,
+            RowKeySchema::new(
+                vec![DataType::Int64, DataType::Int32, DataType::Utf8View],
+                vec![false; 3],
+            ),
+        ),
+        "nullable_row" => input.group_by_aggregate::<RowKeyExtractor, Value>(
+            vec![10, 11],
+            slots,
+            None,
+            RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View], vec![true; 2]),
+        ),
+        "decimal_row" => input.group_by_aggregate::<RowKeyExtractor, Value>(
+            vec![12],
+            slots,
+            None,
+            RowKeySchema::new(vec![DataType::Decimal128(20, 2)], vec![false]),
+        ),
+        "hash_only_distinct" => {
+            input.group_by_distinct_count::<HashOnlyIntKeyExtractor<Int64Type>>(vec![0])
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn bench_run_folding(c: &mut Criterion, d: &DataFlowDispatcher) {
+    let rows = env_usize("PIVOT_BENCH_ROWS", 1048576);
+    for shape in ["run_1", "run_16", "run_64", "shuffled"] {
+        for signature in [
+            "sum",
+            "wide_sum",
+            "extrema",
+            "count_sum",
+            "nullable",
+            "dynamic_numeric",
+            "dynamic_strings",
+        ] {
+            bench(
+                c,
+                d,
+                &format!("run_values/{signature}/{shape}"),
+                rows,
+                || make_run_input(rows, shape),
+                |input| build_run_values(input, signature),
+            );
+        }
+        for representation in [
+            "integer",
+            "long_string",
+            "short_string",
+            "integer_pair",
+            "integer_string",
+            "row_triple",
+            "nullable_row",
+            "decimal_row",
+            "hash_only_distinct",
+        ] {
+            bench(
+                c,
+                d,
+                &format!("run_keys/{representation}/{shape}"),
+                rows,
+                || make_key_run_input(rows, shape),
+                |input| build_run_keys(input, representation),
+            );
+        }
     }
 }
 
@@ -1234,7 +1411,7 @@ fn main() {
     let dispatcher = dispatch.dispatcher().clone();
 
     let mut c = Criterion::default().configure_from_args();
-    bench_count_runs(&mut c, &dispatcher);
+    bench_run_folding(&mut c, &dispatcher);
     bench_group_by(&mut c, &dispatcher);
     bench_filter(&mut c, &dispatcher);
     bench_order_by(&mut c, &dispatcher);

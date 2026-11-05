@@ -116,7 +116,3 @@ required-features = ["test-util"]
 name = "accumulator"
 harness = false
 required-features = ["test-util"]
-
-[[bench]]
-name = "runs"
-harness = false

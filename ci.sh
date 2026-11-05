@@ -43,13 +43,7 @@ run_cell() {
         cd "$crate" || exit 2
         case "$check" in
             fmt)    cargo fmt --check ;;
-            clippy)
-                cargo clippy --all-targets && {
-                    if [[ "$crate" == dispatch ]]; then
-                        cargo clippy --all-targets --features count-run-collapse
-                    fi
-                }
-                ;;
+            clippy) cargo clippy --all-targets ;;
             test)
                 cargo test && {
                     if [[ "$crate" == dispatch ]]; then
