@@ -417,6 +417,63 @@ fn bench<D, F>(
 // GROUP BY scenarios
 // ---------------------------------------------------------------------------
 
+fn bench_count_runs(c: &mut Criterion, d: &DataFlowDispatcher) {
+    let rows = total_rows().max(8192 * 64).div_ceil(8192 * 64) * (8192 * 64);
+    for (name, run_length) in [
+        ("run_1", 1),
+        ("run_4", 4),
+        ("run_16", 16),
+        ("run_64", 64),
+        ("shuffled", 0),
+        ("unique", usize::MAX),
+    ] {
+        bench(
+            c,
+            d,
+            &format!("count_runs/{name}"),
+            rows,
+            || {
+                // Every non-unique shape has the same key frequencies.
+                let mut keys: Vec<i64> = (0..rows)
+                    .map(|row| {
+                        if run_length == usize::MAX {
+                            row as i64
+                        } else {
+                            ((row / run_length.max(1)) % 8192) as i64
+                        }
+                    })
+                    .collect();
+                if run_length == 0 {
+                    let mut rng = Rng::new(42);
+                    for index in (1..keys.len()).rev() {
+                        keys.swap(index, rng.below(index + 1));
+                    }
+                }
+                let sch = schema(vec![Field::new("k", DataType::Int64, false)]);
+                keys.chunks(BATCH_ROWS)
+                    .map(|chunk| batch(&sch, vec![Arc::new(Int64Array::from(chunk.to_vec()))]))
+                    .collect()
+            },
+            |s| {
+                s.group_by_aggregate::<IntKeyExtractor<Int64Type>, Compiled<(CountSlot,)>>(
+                    vec![0],
+                    vec![AggregationSlot::new(
+                        AggregationKind::CountStar,
+                        0,
+                        DataType::Int64,
+                    )],
+                    Some(GroupLimit::TopK {
+                        slot: 0,
+                        limit: 10,
+                        with_ties: false,
+                    }),
+                    (),
+                )
+            },
+        );
+    }
+}
+
 fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
     let rows = total_rows();
 
@@ -1177,6 +1234,7 @@ fn main() {
     let dispatcher = dispatch.dispatcher().clone();
 
     let mut c = Criterion::default().configure_from_args();
+    bench_count_runs(&mut c, &dispatcher);
     bench_group_by(&mut c, &dispatcher);
     bench_filter(&mut c, &dispatcher);
     bench_order_by(&mut c, &dispatcher);

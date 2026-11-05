@@ -50,6 +50,8 @@ httparse = "1.9"
 url = { workspace = true }
 
 [features]
+# Experimental batch-local equal-key run folding.
+count-run-collapse = []
 # Exposes `test_utils` and the test-only worker-waker / free-pool helpers so
 # out-of-crate test suites (e.g. catalog's Parquet reader tests) can drive
 # single operators. Enabled only via those crates' dev-dependencies.
@@ -114,3 +116,7 @@ required-features = ["test-util"]
 name = "accumulator"
 harness = false
 required-features = ["test-util"]
+
+[[bench]]
+name = "runs"
+harness = false

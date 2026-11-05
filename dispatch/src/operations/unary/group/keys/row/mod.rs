@@ -91,6 +91,11 @@ use arrow_array::RecordBatch;
 pub struct RowKeyExtractor;
 
 impl KeyExtractor for RowKeyExtractor {
+    #[inline(always)]
+    fn rows_equal(reader: &Self::Reader<'_>, left: usize, right: usize) -> bool {
+        reader.row(left) == reader.row(right)
+    }
+
     type Config = RowKeySchema;
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = RowKey<'a, 'b>;

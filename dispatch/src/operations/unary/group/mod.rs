@@ -417,6 +417,561 @@ mod tests {
         )
     }
 
+    fn assert_run_aggregate_columns<V: AggregationValue + ?Sized>(
+        input: RecordBatch,
+        slots: Vec<AggregationSlot>,
+        expected: Vec<ArrayRef>,
+    ) {
+        use arrow_array::Array;
+        let batches: Vec<_> = (0..input.num_rows())
+            .step_by(19001)
+            .map(|start| input.slice(start, 19001.min(input.num_rows() - start)))
+            .collect();
+
+        let output = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, V>(
+            vec![batches[..2].to_vec(), batches[2..].to_vec()],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+
+        let render = |columns: &[ArrayRef], row| {
+            columns
+                .iter()
+                .map(|column| {
+                    if column.is_null(row) {
+                        "NULL".to_string()
+                    } else {
+                        arrow::util::display::array_value_to_string(column.as_ref(), row).unwrap()
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut actual: Vec<_> = output
+            .items
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).map(|row| render(batch.columns(), row)))
+            .collect();
+        let mut expected_rows: Vec<_> = (0..3).map(|row| render(&expected, row)).collect();
+        actual.sort();
+        expected_rows.sort();
+        assert_eq!(actual, expected_rows);
+    }
+
+    fn check_run_aggregate_case(case: usize) {
+        use arrow_array::types::Int64Type;
+        use arrow_array::{Float64Array, Int64Array};
+        let rows = 60000;
+        let keys: Vec<i64> = (0..rows).map(|row| ((row / 10003) % 3) as i64).collect();
+        let values: Vec<Option<i32>> = (0..rows)
+            .map(|row| (keys[row] != 2 && row % 7 != 0).then_some((row % 17) as i32 - 8))
+            .collect();
+        let wide: Vec<Option<i64>> = values
+            .iter()
+            .map(|value| value.map(|v| i64::MAX / 1000 + v as i64))
+            .collect();
+        let floats: Vec<Option<f64>> = values
+            .iter()
+            .map(|value| value.map(|v| v as f64 * 0.5))
+            .collect();
+        let strings: Vec<Option<String>> = values
+            .iter()
+            .map(|value| value.map(|v| format!("a-long-string-value-{:02}", v + 8)))
+            .collect();
+        let input = RecordBatch::try_from_iter(vec![
+            ("key", Arc::new(Int64Array::from(keys.clone())) as ArrayRef),
+            ("value", Arc::new(Int32Array::from(values.clone()))),
+            ("wide", Arc::new(Int64Array::from(wide.clone()))),
+            ("float", Arc::new(Float64Array::from(floats.clone()))),
+            (
+                "text",
+                Arc::new(StringViewArray::from_iter(
+                    strings.iter().map(|v| v.as_deref()),
+                )),
+            ),
+        ])
+        .unwrap();
+        let mut counts = vec![0i64; 3];
+        let mut valid = vec![0i64; 3];
+        let mut sums = vec![None; 3];
+        let mut minima = vec![None; 3];
+        let mut maxima = vec![None; 3];
+        let mut wide_sums = vec![None; 3];
+        let mut float_sums = vec![None; 3];
+        let mut text_min: Vec<Option<String>> = vec![None; 3];
+        let mut text_max = text_min.clone();
+        for row in 0..rows {
+            let key = keys[row] as usize;
+            counts[key] += 1;
+            if let Some(value) = values[row] {
+                valid[key] += 1;
+                *sums[key].get_or_insert(0i64) += value as i64;
+                minima[key] = Some(minima[key].unwrap_or(value as i64).min(value as i64));
+                maxima[key] = Some(maxima[key].unwrap_or(value as i64).max(value as i64));
+                *wide_sums[key].get_or_insert(0i128) += wide[row].unwrap() as i128;
+                *float_sums[key].get_or_insert(0.0) += floats[row].unwrap();
+                let text = strings[row].as_ref().unwrap();
+                if text_min[key].as_ref().is_none_or(|old| text < old) {
+                    text_min[key] = Some(text.clone());
+                }
+                if text_max[key].as_ref().is_none_or(|old| text > old) {
+                    text_max[key] = Some(text.clone());
+                }
+            }
+        }
+        let key_column = || Arc::new(Int64Array::from(vec![0, 1, 2])) as ArrayRef;
+        let slot = |kind, column, ty| AggregationSlot::new(kind, column, ty);
+        let numeric_slots = vec![
+            slot(AggregationKind::CountStar, 0, DataType::Int64),
+            slot(AggregationKind::Count, 1, DataType::Int64),
+            slot(AggregationKind::Sum, 1, DataType::Int64),
+            slot(AggregationKind::Min, 1, DataType::Int64),
+            slot(AggregationKind::Max, 1, DataType::Int64),
+        ];
+        let numeric_expected = vec![
+            key_column(),
+            Arc::new(Int64Array::from(counts.clone())),
+            Arc::new(Int64Array::from(valid)),
+            Arc::new(Int64Array::from(sums)),
+            Arc::new(Int64Array::from(minima)),
+            Arc::new(Int64Array::from(maxima)),
+        ];
+
+        match case {
+            0 => {
+                assert_run_aggregate_columns::<
+                    Compiled<
+                        (
+                            CountSlot,
+                            CountValidSlot,
+                            SumSlot<Int32Type>,
+                            MinSlot<Int32Type>,
+                            MaxSlot<Int32Type>,
+                        ),
+                        u8,
+                    >,
+                >(
+                    input.clone(),
+                    numeric_slots.clone(),
+                    numeric_expected.clone(),
+                );
+            }
+            1 => {
+                assert_run_aggregate_columns::<Dynamic<i128, false, u8>>(
+                    input.clone(),
+                    numeric_slots,
+                    numeric_expected,
+                );
+            }
+            2 => {
+                assert_run_aggregate_columns::<Compiled<(SumSlot<Int64Type, i128>,), u8>>(
+                    input.clone(),
+                    vec![slot(AggregationKind::Sum, 2, DataType::Decimal128(38, 0))],
+                    vec![
+                        key_column(),
+                        Arc::new(
+                            arrow_array::Decimal128Array::from(wide_sums)
+                                .with_precision_and_scale(38, 0)
+                                .unwrap(),
+                        ),
+                    ],
+                );
+            }
+            3 => {
+                assert_run_aggregate_columns::<Dynamic<i128, false, u8>>(
+                    input,
+                    vec![
+                        slot(AggregationKind::Sum, 3, DataType::Float64),
+                        slot(AggregationKind::Min, 4, DataType::Utf8View),
+                        slot(AggregationKind::Max, 4, DataType::Utf8View),
+                    ],
+                    vec![
+                        key_column(),
+                        Arc::new(Float64Array::from(float_sums)),
+                        Arc::new(StringViewArray::from_iter(
+                            text_min.iter().map(|v| v.as_deref()),
+                        )),
+                        Arc::new(StringViewArray::from_iter(
+                            text_max.iter().map(|v| v.as_deref()),
+                        )),
+                    ],
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn compiled_nullable_runs_preserve_values_across_windows() {
+        check_run_aggregate_case(0);
+    }
+
+    #[test]
+    fn dynamic_nullable_runs_preserve_values_across_windows() {
+        check_run_aggregate_case(1);
+    }
+
+    #[test]
+    fn wide_sum_runs_preserve_values_across_windows() {
+        check_run_aggregate_case(2);
+    }
+
+    #[test]
+    fn dynamic_float_and_string_runs_preserve_values_across_windows() {
+        check_run_aggregate_case(3);
+    }
+
+    fn check_run_key_case(case: usize) {
+        use arrow_array::types::Int64Type;
+        use arrow_array::{Array, Decimal128Array, Int64Array};
+        use std::collections::BTreeMap;
+        let groups: Vec<i64> = (0..60000).map(|row| ((row / 10003) % 3) as i64).collect();
+        let first: Vec<i64> = groups.iter().map(|group| group / 2).collect();
+        let second: Vec<i32> = groups.iter().map(|group| (group % 2) as i32).collect();
+        let names: Vec<String> = groups
+            .iter()
+            .map(|group| format!("same-prefix-long-ü-string-{group}"))
+            .collect();
+        let values: Vec<i32> = (0..groups.len()).map(|row| (row % 17) as i32 - 8).collect();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(first)),
+            Arc::new(Int32Array::from(second)),
+            Arc::new(StringViewArray::from_iter_values(names.iter())),
+            Arc::new(Int32Array::from(values.clone())),
+            Arc::new(Int64Array::from(
+                groups
+                    .iter()
+                    .map(|group| (group % 2 != 0).then_some(*group))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringViewArray::from_iter(
+                groups
+                    .iter()
+                    .zip(names.iter())
+                    .map(|(group, name)| (*group != 0).then_some(name.as_str())),
+            )),
+            Arc::new(
+                Decimal128Array::from_iter_values(groups.iter().map(|group| *group as i128 * 100))
+                    .with_precision_and_scale(20, 2)
+                    .unwrap(),
+            ),
+            Arc::new(StringViewArray::from_iter_values(groups.iter().map(
+                |group| match group {
+                    0 => "",
+                    1 => "a",
+                    _ => "b",
+                },
+            ))),
+        ];
+        let fields = columns
+            .iter()
+            .enumerate()
+            .map(|(i, column)| {
+                Field::new(
+                    format!("c{i}"),
+                    column.data_type().clone(),
+                    column.null_count() > 0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let input = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let key_columns = match case {
+            0 => vec![2],
+            1 => vec![7],
+            2 => vec![0, 1],
+            3 => vec![0, 2],
+            4 => vec![0, 1, 2],
+            5 => vec![4, 5],
+            6 => vec![6],
+            _ => vec![0],
+        };
+        let render = |columns: &[ArrayRef], row| {
+            columns
+                .iter()
+                .map(|column| {
+                    if column.is_null(row) {
+                        "NULL".to_string()
+                    } else {
+                        arrow::util::display::array_value_to_string(column.as_ref(), row).unwrap()
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut expected = BTreeMap::new();
+        let key_arrays = key_columns
+            .iter()
+            .map(|column| input.column(*column).clone())
+            .collect::<Vec<_>>();
+        for (row, value) in values.iter().enumerate() {
+            let entry = expected
+                .entry(render(&key_arrays, row))
+                .or_insert((0i64, 0i64));
+            entry.0 += 1;
+            entry.1 += *value as i64;
+        }
+        let batches: Vec<_> = (0..input.num_rows())
+            .step_by(19001)
+            .map(|start| input.slice(start, 19001.min(input.num_rows() - start)))
+            .collect();
+        let workers = vec![batches[..2].to_vec(), batches[2..].to_vec()];
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64),
+            AggregationSlot::new(AggregationKind::Sum, 3, DataType::Int64),
+        ];
+        type Value = Compiled<(CountSlot, SumSlot<Int32Type>)>;
+
+        let output = match case {
+            0 | 1 => run_group_configured::<StringKeyExtractor, Value>(
+                workers,
+                key_columns,
+                slots,
+                None,
+                RadixConfig::DEFAULT,
+                (),
+                false,
+            ),
+            2 => run_group_configured::<IntPairKeyExtractor<Int64Type, Int32Type>, Value>(
+                workers,
+                key_columns,
+                slots,
+                None,
+                RadixConfig::DEFAULT,
+                (),
+                false,
+            ),
+            3 => run_group_configured::<IntStrKeyExtractor<Int64Type>, Value>(
+                workers,
+                key_columns,
+                slots,
+                None,
+                RadixConfig::DEFAULT,
+                (),
+                false,
+            ),
+            4..=6 => {
+                let config = RowKeySchema::new(
+                    key_arrays
+                        .iter()
+                        .map(|column| column.data_type().clone())
+                        .collect::<Vec<_>>(),
+                    key_arrays
+                        .iter()
+                        .map(|column| column.null_count() > 0)
+                        .collect::<Vec<_>>(),
+                );
+                run_group_configured::<RowKeyExtractor, Value>(
+                    workers,
+                    key_columns,
+                    slots,
+                    None,
+                    RadixConfig::DEFAULT,
+                    config,
+                    false,
+                )
+            }
+            _ => run_group_configured::<HashOnlyIntKeyExtractor<Int64Type>, Distinct>(
+                workers,
+                key_columns,
+                vec![],
+                None,
+                RadixConfig::DEFAULT,
+                (),
+                true,
+            ),
+        };
+
+        if case == 7 {
+            assert_eq!(
+                output.i64_column(0).iter().sum::<i64>(),
+                expected.len() as i64
+            );
+        } else {
+            let mut actual = output
+                .items
+                .iter()
+                .flat_map(|batch| (0..batch.num_rows()).map(|row| render(batch.columns(), row)))
+                .collect::<Vec<_>>();
+            let mut expected = expected
+                .into_iter()
+                .map(|(mut key, (count, sum))| {
+                    key.extend([count.to_string(), sum.to_string()]);
+                    key
+                })
+                .collect::<Vec<_>>();
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn long_string_runs_preserve_complete_keys() {
+        check_run_key_case(0);
+    }
+
+    #[test]
+    fn short_string_runs_preserve_complete_keys() {
+        check_run_key_case(1);
+    }
+
+    #[test]
+    fn integer_pair_runs_preserve_complete_keys() {
+        check_run_key_case(2);
+    }
+
+    #[test]
+    fn integer_string_runs_preserve_complete_keys() {
+        check_run_key_case(3);
+    }
+
+    #[test]
+    fn row_triple_runs_preserve_complete_keys() {
+        check_run_key_case(4);
+    }
+
+    #[test]
+    fn nullable_row_runs_preserve_complete_keys() {
+        check_run_key_case(5);
+    }
+
+    #[test]
+    fn decimal_row_runs_preserve_complete_keys() {
+        check_run_key_case(6);
+    }
+
+    #[test]
+    fn hash_only_distinct_runs_preserve_complete_keys() {
+        check_run_key_case(7);
+    }
+
+    #[test]
+    fn string_key_runs_preserve_nullable_string_and_float_aggregates() {
+        use arrow_array::{Array, Float64Array, Int64Array};
+        let groups: Vec<usize> = (0..60000).map(|row| (row / 10003) % 3).collect();
+        let names: Vec<String> = groups
+            .iter()
+            .map(|group| format!("long-ü-group-key-{group}"))
+            .collect();
+        let texts: Vec<Option<String>> = (0..groups.len())
+            .map(|row| {
+                (groups[row] != 2 && row % 7 != 0)
+                    .then(|| format!("long-text-value-{:03}", row % 101))
+            })
+            .collect();
+        let values: Vec<Option<f64>> = (0..groups.len())
+            .map(|row| (groups[row] != 2 && row % 5 != 0).then_some((row % 17) as f64 * 0.5))
+            .collect();
+        let input = RecordBatch::try_from_iter(vec![
+            (
+                "key",
+                Arc::new(StringViewArray::from_iter_values(names.iter())) as ArrayRef,
+            ),
+            (
+                "text",
+                Arc::new(StringViewArray::from_iter(
+                    texts.iter().map(|v| v.as_deref()),
+                )),
+            ),
+            ("value", Arc::new(Float64Array::from(values.clone()))),
+        ])
+        .unwrap();
+        let mut counts = vec![0i64; 3];
+        let mut sums = vec![None; 3];
+        let mut minima: Vec<Option<String>> = vec![None; 3];
+        let mut maxima = minima.clone();
+        for row in 0..groups.len() {
+            let group = groups[row];
+            counts[group] += 1;
+            if let Some(value) = values[row] {
+                *sums[group].get_or_insert(0.0) += value;
+            }
+            if let Some(text) = &texts[row] {
+                if minima[group].as_ref().is_none_or(|old| text < old) {
+                    minima[group] = Some(text.clone());
+                }
+                if maxima[group].as_ref().is_none_or(|old| text > old) {
+                    maxima[group] = Some(text.clone());
+                }
+            }
+        }
+        let batches: Vec<_> = (0..input.num_rows())
+            .step_by(19001)
+            .map(|start| input.slice(start, 19001.min(input.num_rows() - start)))
+            .collect();
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64),
+            AggregationSlot::new(AggregationKind::Sum, 2, DataType::Float64),
+            AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View),
+            AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View),
+        ];
+        let expected: Vec<ArrayRef> = vec![
+            Arc::new(StringViewArray::from_iter_values(
+                (0..3).map(|group| format!("long-ü-group-key-{group}")),
+            )),
+            Arc::new(Int64Array::from(counts)),
+            Arc::new(Float64Array::from(sums)),
+            Arc::new(StringViewArray::from_iter(
+                minima.iter().map(|v| v.as_deref()),
+            )),
+            Arc::new(StringViewArray::from_iter(
+                maxima.iter().map(|v| v.as_deref()),
+            )),
+        ];
+
+        let output = run_group_configured::<StringKeyExtractor, Dynamic<i128, false, u8>>(
+            vec![batches[..2].to_vec(), batches[2..].to_vec()],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+            (),
+            false,
+        );
+
+        let render = |columns: &[ArrayRef], row| {
+            columns
+                .iter()
+                .map(|column| {
+                    if column.is_null(row) {
+                        "NULL".to_string()
+                    } else {
+                        arrow::util::display::array_value_to_string(column.as_ref(), row).unwrap()
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut actual: Vec<_> = output
+            .items
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).map(|row| render(batch.columns(), row)))
+            .collect();
+        let mut expected_rows: Vec<_> = (0..3).map(|row| render(&expected, row)).collect();
+        actual.sort();
+        expected_rows.sort();
+        assert_eq!(actual, expected_rows);
+    }
+
+    #[test]
+    fn count_repeated_runs_across_batches_and_workers() {
+        use std::collections::BTreeMap;
+        let rows: Vec<i32> = (0..24000).map(|row| ((row / 37) % 137) - 68).collect();
+        let mut expected = BTreeMap::new();
+        for key in &rows {
+            *expected.entry(*key).or_insert(0i64) += 1;
+        }
+        let batches = rows.chunks(7001).map(batch_with_column).collect::<Vec<_>>();
+
+        let result = run_group(vec![batches[..2].to_vec(), batches[2..].to_vec()]);
+
+        let actual: BTreeMap<_, _> = result
+            .i32_column(0)
+            .into_iter()
+            .zip(result.i64_column(1))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn batch_wider_than_record_batch_size() {
         // A single input batch wider than RECORD_BATCH_SIZE (8192) must be
@@ -453,6 +1008,26 @@ mod tests {
         output_limit: Option<GroupLimit>,
         radix: RadixConfig,
     ) -> CollectSender {
+        run_group_configured::<K, V>(
+            worker_batches,
+            key_cols,
+            value_slots,
+            output_limit,
+            radix,
+            K::Config::default(),
+            false,
+        )
+    }
+
+    fn run_group_configured<K: KeyExtractor, V: AggregationValue + ?Sized>(
+        worker_batches: Vec<Vec<RecordBatch>>,
+        key_cols: Vec<usize>,
+        value_slots: Vec<AggregationSlot>,
+        output_limit: Option<GroupLimit>,
+        radix: RadixConfig,
+        key_config: K::Config,
+        count_only: bool,
+    ) -> CollectSender {
         init_test_free_pool(64);
         let worker_count = worker_batches.len();
         let key_arena = SharedArena::new(64);
@@ -473,9 +1048,9 @@ mod tests {
                     injector.clone(),
                     key_cols.clone(),
                     value_slots.clone(),
-                    K::Config::default(),
+                    key_config.clone(),
                     output_limit,
-                    false,
+                    count_only,
                     gather.clone(),
                     partition_jobs_injected.clone(),
                     radix,

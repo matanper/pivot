@@ -59,6 +59,11 @@ where
     // in-place (no radix) — the out-of-band count lives on the in-place table.
     const DEDUP_BY_HASH: bool = true;
 
+    #[inline(always)]
+    fn rows_equal(reader: &Self::Reader<'_>, left: usize, right: usize) -> bool {
+        reader.value(left).to_u64() == reader.value(right).to_u64()
+    }
+
     type Config = ();
     type Persisted = ();
     type LiveKey<'a, 'b> = ();

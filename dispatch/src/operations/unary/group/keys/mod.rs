@@ -59,6 +59,45 @@ pub trait KeyExtractor: Send + 'static {
     /// no bytes to scatter, so it never takes the radix path.
     const DEDUP_BY_HASH: bool = false;
 
+    /// Compares complete grouping keys using this extractor's canonical representation.
+    fn rows_equal(reader: &Self::Reader<'_>, left: usize, right: usize) -> bool;
+
+    /// Samples adjacency before choosing the run-folding loop.
+    #[inline(always)]
+    fn has_runs(reader: &Self::Reader<'_>, hashes: &[u64]) -> bool {
+        let length = hashes.len();
+        if length < 2 {
+            return false;
+        }
+        let samples = 16.min(length - 1);
+        let required = samples.div_ceil(4);
+        let mut repeated = 0;
+        for sample in 0..samples {
+            let row = (sample * 509 + 17) % (length - 1);
+            repeated += usize::from(
+                hashes[row] == hashes[row + 1] && Self::rows_equal(reader, row, row + 1),
+            );
+            if repeated >= required {
+                return true;
+            }
+            // Avoid the full sample on sparse input; this decision only affects cost.
+            if sample == 3 && repeated == 0 {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Exclusive end of the equal-key run beginning at `start`.
+    #[inline(always)]
+    fn run_end(reader: &Self::Reader<'_>, start: usize, length: usize) -> usize {
+        let mut end = start + 1;
+        while end < length && Self::rows_equal(reader, start, end) {
+            end += 1;
+        }
+        end
+    }
+
     /// Runtime configuration threaded from the operator spec to the per-batch
     /// reader and the output columns. Most extractors are fully determined by
     /// their type and use `()`; [`RowKeyExtractor`] carries its key schema here

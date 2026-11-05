@@ -43,8 +43,20 @@ run_cell() {
         cd "$crate" || exit 2
         case "$check" in
             fmt)    cargo fmt --check ;;
-            clippy) cargo clippy --all-targets ;;
-            test)   cargo test ;;
+            clippy)
+                cargo clippy --all-targets && {
+                    if [[ "$crate" == dispatch ]]; then
+                        cargo clippy --all-targets --features count-run-collapse
+                    fi
+                }
+                ;;
+            test)
+                cargo test && {
+                    if [[ "$crate" == dispatch ]]; then
+                        cargo test --features count-run-collapse
+                    fi
+                }
+                ;;
             # Both the public-docs and internal-docs builds CI gates on.
             doc)    cargo doc --no-deps &&
                     cargo doc --document-private-items --no-deps ;;
