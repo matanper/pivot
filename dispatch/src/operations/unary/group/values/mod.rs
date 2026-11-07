@@ -261,6 +261,35 @@ pub trait AggregationValue: Send + Sync + 'static {
     /// Per-worker consume state.
     type WorkerContext: WorkerContext;
 
+    /// Seeds a partial from a nonempty contiguous run of equal group keys.
+    #[inline(always)]
+    fn seed_run(
+        &mut self,
+        reader: &Self::Reader<'_>,
+        start: usize,
+        end: usize,
+        worker: &mut Self::WorkerContext,
+        context: &Self::SharedContext,
+    ) {
+        self.seed(reader, start, worker);
+        self.update_run(reader, start + 1, end, worker, context);
+    }
+
+    /// Folds a contiguous run without probing the hash table again.
+    #[inline(always)]
+    fn update_run(
+        &mut self,
+        reader: &Self::Reader<'_>,
+        start: usize,
+        end: usize,
+        worker: &mut Self::WorkerContext,
+        context: &Self::SharedContext,
+    ) {
+        for row in start..end {
+            self.update(reader, row, worker, context);
+        }
+    }
+
     /// Binds input columns for one batch.
     fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b>;
 

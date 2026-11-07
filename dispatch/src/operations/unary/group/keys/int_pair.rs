@@ -56,6 +56,11 @@ where
     A::Native: IntBits,
     B::Native: IntBits,
 {
+    #[inline(always)]
+    fn rows_equal(reader: &Self::Reader<'_>, left: usize, right: usize) -> bool {
+        reader.packed(left) == reader.packed(right)
+    }
+
     type Config = ();
     type Persisted = u128;
     type LiveKey<'a, 'b> = u128;

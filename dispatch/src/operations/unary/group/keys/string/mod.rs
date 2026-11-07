@@ -23,6 +23,11 @@ use std::sync::Arc;
 pub struct StringKeyExtractor;
 
 impl KeyExtractor for StringKeyExtractor {
+    #[inline(always)]
+    fn rows_equal(reader: &Self::Reader<'_>, left: usize, right: usize) -> bool {
+        reader.value(left) == reader.value(right)
+    }
+
     type Config = ();
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = StringKey<'a, 'b>;

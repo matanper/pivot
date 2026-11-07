@@ -695,6 +695,22 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized, const INLINE_PROBE: bool> Ar
 {
     #[inline(always)]
     fn run<const N: usize>(self) -> bool {
+        if cfg!(feature = "count-run-collapse")
+            && K::has_runs(self.key_reader, &self.hashes[..self.length])
+        {
+            self.probe_selected::<N, true>()
+        } else {
+            self.probe_selected::<N, false>()
+        }
+    }
+}
+
+impl<K: KeyExtractor, V: AggregationValue + ?Sized, const INLINE_PROBE: bool>
+    ProbeWindow<'_, '_, K, V, INLINE_PROBE>
+{
+    /// Selects a separately compiled loop before entering the per-row path.
+    #[inline(always)]
+    fn probe_selected<const N: usize, const COLLAPSE_RUNS: bool>(self) -> bool {
         let ProbeWindow {
             table,
             key_arena,
@@ -709,7 +725,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized, const INLINE_PROBE: bool> Ar
         } = self;
         if INLINE_PROBE {
             // The AVX-512 tiers' larger register file makes inlining worthwhile.
-            probe_rows_body::<N, K, V>(
+            probe_rows_body::<N, COLLAPSE_RUNS, K, V>(
                 table,
                 key_arena,
                 worker_context,
@@ -722,7 +738,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized, const INLINE_PROBE: bool> Ar
                 shared_context,
             )
         } else {
-            probe_rows_outlined::<N, K, V>(
+            probe_rows_outlined::<N, COLLAPSE_RUNS, K, V>(
                 table,
                 key_arena,
                 worker_context,
@@ -748,7 +764,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized, const INLINE_PROBE: bool> Ar
 /// table writes, allowing bound column pointers to remain outside the row loop.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn probe_rows_outlined<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
+fn probe_rows_outlined<
+    const N: usize,
+    const COLLAPSE_RUNS: bool,
+    K: KeyExtractor,
+    V: AggregationValue + ?Sized,
+>(
     table: &mut HashTable<K::Persisted, V>,
     key_arena: &mut WorkerArena,
     worker_context: &mut V::WorkerContext,
@@ -760,7 +781,7 @@ fn probe_rows_outlined<const N: usize, K: KeyExtractor, V: AggregationValue + ?S
     value_reader: &V::Reader<'_>,
     shared_context: &V::SharedContext,
 ) -> bool {
-    probe_rows_body::<N, K, V>(
+    probe_rows_body::<N, COLLAPSE_RUNS, K, V>(
         table,
         key_arena,
         worker_context,
@@ -778,7 +799,12 @@ fn probe_rows_outlined<const N: usize, K: KeyExtractor, V: AggregationValue + ?S
 // tier. The floor wrapper itself stays outlined.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn probe_rows_body<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
+fn probe_rows_body<
+    const N: usize,
+    const COLLAPSE_RUNS: bool,
+    K: KeyExtractor,
+    V: AggregationValue + ?Sized,
+>(
     table: &mut HashTable<K::Persisted, V>,
     key_arena: &mut WorkerArena,
     worker_context: &mut V::WorkerContext,
@@ -816,18 +842,34 @@ fn probe_rows_body<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized
             if row + L1_DISTANCE < length {
                 prober.prefetch(hashes[row + L1_DISTANCE]);
             }
-            // Probe once, then seed a new group or update the matching group.
             let key = K::live_key(key_reader, row, key_arena);
-            prober.probe_fold::<false, _, _, _, _>(
-                hash,
-                key,
-                &mut *worker_context,
-                |worker_context, stored| stored.seed(value_reader, row, worker_context),
-                |worker_context, stored| {
-                    stored.update(value_reader, row, worker_context, shared_context)
-                },
-            );
-            row += 1;
+            if COLLAPSE_RUNS {
+                let end = K::run_end(key_reader, row, length);
+                // A run stays inside this window; growth follows the folded run.
+                prober.probe_fold::<false, _, _, _, _>(
+                    hash,
+                    key,
+                    &mut *worker_context,
+                    |worker_context, stored| {
+                        stored.seed_run(value_reader, row, end, worker_context, shared_context)
+                    },
+                    |worker_context, stored| {
+                        stored.update_run(value_reader, row, end, worker_context, shared_context)
+                    },
+                );
+                row = end;
+            } else {
+                prober.probe_fold::<false, _, _, _, _>(
+                    hash,
+                    key,
+                    &mut *worker_context,
+                    |worker_context, stored| stored.seed(value_reader, row, worker_context),
+                    |worker_context, stored| {
+                        stored.update(value_reader, row, worker_context, shared_context)
+                    },
+                );
+                row += 1;
+            }
             if prober.undersized() {
                 overflowed = true;
                 break;

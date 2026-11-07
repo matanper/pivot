@@ -417,6 +417,235 @@ mod tests {
         )
     }
 
+    fn make_run_fixture() -> RecordBatch {
+        use arrow_array::{Decimal128Array, Float64Array, Int64Array};
+        let rows = 4 * 4101;
+        let group = |row: usize| (row / 4101) as i64;
+        let valid = |row| group(row) != 2 && row % 7 != 0;
+        let text = |key| match key {
+            0 => String::new(),
+            3 => "a".to_string(),
+            _ => format!("same-prefix-long-ü-key-{key}"),
+        };
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from_iter_values(
+                (0..rows).map(|row| group(row) - 2),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                (0..rows).map(|row| group(row) / 2 - 1),
+            )),
+            Arc::new(Int32Array::from_iter_values(
+                (0..rows).map(|row| (group(row) % 2) as i32),
+            )),
+            Arc::new(StringViewArray::from_iter_values(
+                (0..rows).map(|row| text(group(row))),
+            )),
+            Arc::new(Int64Array::from_iter(
+                (0..rows).map(|row| (group(row) % 2 != 0).then_some(group(row) / 2 - 1)),
+            )),
+            Arc::new(StringViewArray::from_iter(
+                (0..rows).map(|row| (group(row) != 0).then(|| text(group(row) - 1))),
+            )),
+            Arc::new(
+                Decimal128Array::from_iter_values(
+                    (0..rows).map(|row| (group(row) - 2) as i128 * 100),
+                )
+                .with_precision_and_scale(20, 2)
+                .unwrap(),
+            ),
+            Arc::new(Int32Array::from_iter(
+                (0..rows).map(|row| valid(row).then_some((row % 17) as i32 - 8)),
+            )),
+            Arc::new(Int64Array::from_iter((0..rows).map(|row| {
+                valid(row).then_some(i64::MAX / 1000 + (row % 17) as i64)
+            }))),
+            Arc::new(Float64Array::from_iter(
+                (0..rows).map(|row| valid(row).then_some((row % 17) as f64 * 0.5)),
+            )),
+            Arc::new(StringViewArray::from_iter((0..rows).map(|row| {
+                valid(row).then(|| format!("long-value-{:03}", row % 101))
+            }))),
+            Arc::new(StringViewArray::from_iter_values(
+                (0..rows).map(|row| format!("k{}", group(row))),
+            )),
+        ];
+        RecordBatch::try_from_iter(
+            columns
+                .into_iter()
+                .enumerate()
+                .map(|(index, column)| (format!("c{index}"), column)),
+        )
+        .unwrap()
+    }
+
+    fn make_run_schema(columns: &[usize]) -> RowKeySchema {
+        let input = make_run_fixture();
+        RowKeySchema::new(
+            columns
+                .iter()
+                .map(|index| input.column(*index).data_type().clone())
+                .collect::<Vec<_>>(),
+            columns
+                .iter()
+                .map(|index| input.column(*index).null_count() != 0)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn check_runs<K: KeyExtractor, V: AggregationValue + ?Sized>(
+        keys: Vec<usize>,
+        slots: Vec<AggregationSlot>,
+        config: K::Config,
+        count_only: bool,
+    ) {
+        let description = format!(
+            "{} / {} / {keys:?}",
+            std::any::type_name::<K>(),
+            std::any::type_name::<V>()
+        );
+        let input = make_run_fixture();
+        let evaluate = move |single_rows| {
+            let workers = [
+                input.slice(0, 9001),
+                input.slice(9001, input.num_rows() - 9001),
+            ]
+            .into_iter()
+            .map(|batch| {
+                if single_rows {
+                    (0..batch.num_rows())
+                        .map(|row| batch.slice(row, 1))
+                        .collect()
+                } else {
+                    vec![batch]
+                }
+            })
+            .collect();
+            let output = run_group_configured::<K, V>(
+                workers,
+                keys.clone(),
+                slots.clone(),
+                None,
+                RadixConfig::DEFAULT,
+                config.clone(),
+                count_only,
+            );
+            if count_only {
+                return vec![vec![output.i64_column(0).iter().sum::<i64>().to_string()]];
+            }
+            let mut rows = output
+                .items
+                .iter()
+                .flat_map(|batch| {
+                    (0..batch.num_rows()).map(|row| {
+                        batch
+                            .columns()
+                            .iter()
+                            .map(|column| {
+                                if column.is_null(row) {
+                                    "NULL".to_string()
+                                } else {
+                                    arrow::util::display::array_value_to_string(
+                                        column.as_ref(),
+                                        row,
+                                    )
+                                    .unwrap()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        };
+        // One-row batches force the original row loop. A separate thread gives
+        // each evaluation its own test memory context.
+        let reference = evaluate.clone();
+        let expected = std::thread::spawn(move || reference(true)).join().unwrap();
+
+        let actual = std::thread::spawn(move || evaluate(false)).join().unwrap();
+
+        assert_eq!(actual, expected, "{description}");
+    }
+
+    fn make_numeric_run_slots() -> Vec<AggregationSlot> {
+        [
+            AggregationKind::CountStar,
+            AggregationKind::Count,
+            AggregationKind::Sum,
+            AggregationKind::Min,
+            AggregationKind::Max,
+        ]
+        .into_iter()
+        .map(|kind| AggregationSlot::new(kind, 7, DataType::Int64))
+        .collect()
+    }
+
+    fn check_default_runs<K: KeyExtractor<Config: Default>, V: AggregationValue + ?Sized>(
+        keys: Vec<usize>,
+        slots: Vec<AggregationSlot>,
+    ) {
+        check_runs::<K, V>(keys, slots, K::Config::default(), false);
+    }
+
+    #[test]
+    fn runs_match_rowwise_aggregation() {
+        use arrow_array::types::Int64Type;
+        type Integer = IntKeyExtractor<Int64Type>;
+        type Nullable = Dynamic<i128, false, u8>;
+        type Numeric = Compiled<
+            (
+                CountSlot,
+                CountValidSlot,
+                SumSlot<Int32Type>,
+                MinSlot<Int32Type>,
+                MaxSlot<Int32Type>,
+            ),
+            u8,
+        >;
+        type CountSum = Compiled<(CountSlot, SumSlot<Int32Type>), u8>;
+        type Wide = Compiled<(SumSlot<Int64Type, i128>,), u8>;
+        let count_sum = || {
+            vec![
+                AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64),
+                AggregationSlot::new(AggregationKind::Sum, 7, DataType::Int64),
+            ]
+        };
+        let string_float = || {
+            vec![
+                AggregationSlot::new(AggregationKind::Sum, 9, DataType::Float64),
+                AggregationSlot::new(AggregationKind::Min, 10, DataType::Utf8View),
+                AggregationSlot::new(AggregationKind::Max, 10, DataType::Utf8View),
+            ]
+        };
+
+        check_default_runs::<Integer, Numeric>(vec![0], make_numeric_run_slots());
+        check_default_runs::<Integer, Nullable>(vec![0], make_numeric_run_slots());
+        check_default_runs::<Integer, Wide>(
+            vec![0],
+            vec![AggregationSlot::new(
+                AggregationKind::Sum,
+                8,
+                DataType::Decimal128(38, 0),
+            )],
+        );
+        check_default_runs::<Integer, Nullable>(vec![0], string_float());
+        check_default_runs::<StringKeyExtractor, CountSum>(vec![3], count_sum());
+        check_default_runs::<StringKeyExtractor, CountSum>(vec![11], count_sum());
+        check_default_runs::<IntPairKeyExtractor<Int64Type, Int32Type>, CountSum>(
+            vec![1, 2],
+            count_sum(),
+        );
+        check_default_runs::<IntStrKeyExtractor<Int64Type>, CountSum>(vec![1, 3], count_sum());
+        for keys in [vec![1, 2, 3], vec![4, 5], vec![6]] {
+            let config = make_run_schema(&keys);
+            check_runs::<RowKeyExtractor, CountSum>(keys, count_sum(), config, false);
+        }
+        check_runs::<HashOnlyIntKeyExtractor<Int64Type>, Distinct>(vec![0], vec![], (), true);
+        check_default_runs::<StringKeyExtractor, Nullable>(vec![3], string_float());
+        check_default_runs::<IntExtractor, CountValue>(vec![2], count_slots());
+    }
+
     #[test]
     fn batch_wider_than_record_batch_size() {
         // A single input batch wider than RECORD_BATCH_SIZE (8192) must be
@@ -453,6 +682,26 @@ mod tests {
         output_limit: Option<GroupLimit>,
         radix: RadixConfig,
     ) -> CollectSender {
+        run_group_configured::<K, V>(
+            worker_batches,
+            key_cols,
+            value_slots,
+            output_limit,
+            radix,
+            K::Config::default(),
+            false,
+        )
+    }
+
+    fn run_group_configured<K: KeyExtractor, V: AggregationValue + ?Sized>(
+        worker_batches: Vec<Vec<RecordBatch>>,
+        key_cols: Vec<usize>,
+        value_slots: Vec<AggregationSlot>,
+        output_limit: Option<GroupLimit>,
+        radix: RadixConfig,
+        key_config: K::Config,
+        count_only: bool,
+    ) -> CollectSender {
         init_test_free_pool(64);
         let worker_count = worker_batches.len();
         let key_arena = SharedArena::new(64);
@@ -473,9 +722,9 @@ mod tests {
                     injector.clone(),
                     key_cols.clone(),
                     value_slots.clone(),
-                    K::Config::default(),
+                    key_config.clone(),
                     output_limit,
-                    false,
+                    count_only,
                     gather.clone(),
                     partition_jobs_injected.clone(),
                     radix,

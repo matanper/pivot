@@ -38,6 +38,11 @@ impl<T: ArrowPrimitiveType + Send + 'static> KeyExtractor for IntKeyExtractor<T>
 where
     T::Native: PersistedKey + Hash + Eq,
 {
+    #[inline(always)]
+    fn rows_equal(reader: &Self::Reader<'_>, left: usize, right: usize) -> bool {
+        reader.value(left) == reader.value(right)
+    }
+
     type Config = ();
     type Persisted = T::Native;
     type LiveKey<'a, 'b> = T::Native;
